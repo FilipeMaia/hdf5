@@ -712,7 +712,7 @@ typedef struct {
     #define HDfileno(F)    fileno(F)
 #endif /* HDfileno */
 #ifndef HDflock
-    #define HDflock(F,L)    flock(F,L)
+    #define HDflock(F,L)    0
 #endif /* HDflock */
 #ifndef HDfloor
     #define HDfloor(X)    floor(X)
