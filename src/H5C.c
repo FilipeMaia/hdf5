@@ -70,13 +70,14 @@
  *
  **************************************************************************/
 
+#define H5AC_PACKAGE            /*suppress error about including H5ACpkg  */
 #define H5C_PACKAGE		/*suppress error about including H5Cpkg   */
 #define H5F_PACKAGE		/*suppress error about including H5Fpkg	  */
 
 
 #include "H5private.h"		/* Generic Functions			*/
 #ifdef H5_HAVE_PARALLEL
-#include "H5ACprivate.h"        /* Metadata cache                       */
+#include "H5ACpkg.h"        /* Metadata cache                       */
 #endif /* H5_HAVE_PARALLEL */
 #include "H5Cpkg.h"		/* Cache				*/
 #include "H5Dprivate.h"		/* Dataset functions			*/
@@ -99,6 +100,9 @@ H5FL_DEFINE_STATIC(H5C_t);
 
 /* Declare a free list to manage flush dependency arrays */
 H5FL_BLK_DEFINE_STATIC(parent);
+
+/* Declare a free list to manage corked object addresses */
+H5FL_DEFINE_STATIC(haddr_t);
 
 
 /*
@@ -172,6 +176,9 @@ static herr_t H5C_tag_entry(H5C_t * cache_ptr,
 static herr_t H5C_mark_tagged_entries(H5C_t * cache_ptr, 
                                       haddr_t tag,
                                       hbool_t mark_clean);
+static herr_t H5C_mark_tagged_entries_cork(H5C_t *cache_ptr, 
+				           haddr_t obj_addr, 
+					   hbool_t val);
 
 static herr_t H5C_flush_marked_entries(H5F_t * f, 
                                        hid_t primary_dxpl_id, 
@@ -1152,6 +1159,11 @@ H5C_create(size_t		      max_cache_size,
         HGOTO_ERROR(H5E_CACHE, H5E_CANTCREATE, NULL, "can't create skip list.")
     }
 
+    if ( (cache_ptr->cork_list_ptr = H5SL_create(H5SL_TYPE_HADDR, NULL)) == NULL ) {
+
+        HGOTO_ERROR(H5E_CACHE, H5E_CANTCREATE, NULL, "can't create skip list for corked object addresses.")
+    }
+
     /* If we get this far, we should succeed.  Go ahead and initialize all
      * the fields.
      */
@@ -1160,7 +1172,11 @@ H5C_create(size_t		      max_cache_size,
 
     cache_ptr->flush_in_progress		= FALSE;
 
-    cache_ptr->trace_file_ptr			= NULL;
+    cache_ptr->logging_enabled                  = FALSE;
+
+    cache_ptr->currently_logging                = FALSE;
+
+    cache_ptr->log_file_ptr			= NULL;
 
     cache_ptr->aux_ptr				= aux_ptr;
 
@@ -1304,6 +1320,9 @@ done:
 
             if ( cache_ptr->slist_ptr != NULL )
                 H5SL_close(cache_ptr->slist_ptr);
+
+            if ( cache_ptr->cork_list_ptr != NULL )
+                H5SL_close(cache_ptr->cork_list_ptr);
 
             cache_ptr->magic = 0;
             cache_ptr = H5FL_FREE(H5C_t, cache_ptr);
@@ -1504,6 +1523,35 @@ H5C_def_auto_resize_rpt_fcn(H5C_t * cache_ptr,
 
 
 /*-------------------------------------------------------------------------
+ * Function:    H5C_free_cork_list_cb
+ *
+ * Purpose:     Callback function to free the list of object addresses 
+ *		on the skip list.
+ *
+ * Return:      Non-negative on success/Negative on failure
+ *
+ * Programmer:  Vailin Choi; January 2014
+ *
+ *-------------------------------------------------------------------------
+ */
+static herr_t
+H5C_free_cork_list_cb(void *_item, void UNUSED *key, void UNUSED *op_data)
+{
+    haddr_t *addr = (haddr_t *)_item;
+
+    FUNC_ENTER_NOAPI_NOINIT_NOERR
+
+    HDassert(addr);
+
+    /* Release the item */
+    addr = H5FL_FREE(haddr_t, addr);
+
+    FUNC_LEAVE_NOAPI(0)
+}  /* H5C_free_cork_list_cb() */
+
+
+
+/*-------------------------------------------------------------------------
  * Function:    H5C_dest
  *
  * Purpose:     Flush all data to disk and destroy the cache.
@@ -1549,6 +1597,11 @@ H5C_dest(H5F_t * f,
     if(cache_ptr->slist_ptr != NULL) {
         H5SL_close(cache_ptr->slist_ptr);
         cache_ptr->slist_ptr = NULL;
+    } /* end if */
+
+    if(cache_ptr->cork_list_ptr != NULL) {
+        H5SL_destroy(cache_ptr->cork_list_ptr, H5C_free_cork_list_cb, NULL);
+        cache_ptr->cork_list_ptr = NULL;
     } /* end if */
 
     cache_ptr->magic = 0;
@@ -2421,6 +2474,7 @@ H5C_get_entry_status(const H5F_t *f,
                      hbool_t * is_dirty_ptr,
                      hbool_t * is_protected_ptr,
 		     hbool_t * is_pinned_ptr,
+		     hbool_t * is_corked_ptr,
 		     hbool_t * is_flush_dep_parent_ptr,
                      hbool_t * is_flush_dep_child_ptr)
 {
@@ -2479,6 +2533,11 @@ H5C_get_entry_status(const H5F_t *f,
         if ( is_pinned_ptr != NULL ) {
 
             *is_pinned_ptr = entry_ptr->is_pinned;
+        }
+
+        if ( is_corked_ptr != NULL ) {
+
+            *is_corked_ptr = entry_ptr->is_corked;
         }
 
         if ( is_flush_dep_parent_ptr != NULL ) {
@@ -2541,66 +2600,320 @@ done:
 
 
 /*-------------------------------------------------------------------------
- * Function:    H5C_get_trace_file_ptr
+ * Function:    H5C_set_up_logging
  *
- * Purpose:     Get the trace_file_ptr field from the cache.
+ * Purpose:     Setup for metadata cache logging.
  *
- *              This field will either be NULL (which indicates that trace
- *              file logging is turned off), or contain a pointer to the
- *              open file to which trace file data is to be written.
+ *              Metadata logging is enabled and disabled at two levels. This
+ *              function and the associated tear_down function open and close
+ *              the log file. the start_ and stop_logging functions are then
+ *              used to switch logging on/off. Optionally, logging can begin
+ *              as soon as the log file is opened (set via the start_immediately
+ *              parameter to this function).
+ *
+ *              The log functionality is split between the H5C and H5AC
+ *              packages. Log state and direct log manipulation resides in
+ *              H5C. Log messages are generated in H5AC and sent to
+ *              the H5C_write_log_message function.
  *
  * Return:      Non-negative on success/Negative on failure
- *
- * Programmer:  John Mainzer
- *              1/20/06
  *
  *-------------------------------------------------------------------------
  */
 herr_t
-H5C_get_trace_file_ptr(const H5C_t *cache_ptr, FILE **trace_file_ptr_ptr)
+H5C_set_up_logging(H5C_t *cache_ptr, const char log_location[],
+    hbool_t start_immediately)
 {
-    FUNC_ENTER_NOAPI_NOERR
+#ifdef H5_HAVE_PARALLEL
+    H5AC_aux_t *aux_ptr = NULL;
+#endif /*H5_HAVE_PARALLEL*/
+    char *file_name;
+    size_t n_chars;
+    herr_t ret_value = SUCCEED;      /* Return value */
+
+    FUNC_ENTER_NOAPI(FAIL)
 
     HDassert(cache_ptr);
     HDassert(cache_ptr->magic == H5C__H5C_T_MAGIC);
-    HDassert(trace_file_ptr_ptr);
+    HDassert(log_location);
 
-    *trace_file_ptr_ptr = cache_ptr->trace_file_ptr;
+    /* Sanity checks */
+    if(NULL == cache_ptr)
+        HGOTO_ERROR(H5E_ARGS, H5E_BADVALUE, FAIL, "cache_ptr == NULL")
 
-    FUNC_LEAVE_NOAPI(SUCCEED)
-} /* H5C_get_trace_file_ptr() */
+    if(H5C__H5C_T_MAGIC != cache_ptr->magic)
+        HGOTO_ERROR(H5E_ARGS, H5E_BADVALUE, FAIL, "cache magic value incorrect")
+
+    if(cache_ptr->logging_enabled)
+        HGOTO_ERROR(H5E_CACHE, H5E_SYSTEM, FAIL, "logging already set up")
+
+    if(NULL == log_location)
+        HGOTO_ERROR(H5E_ARGS, H5E_BADVALUE, FAIL, "NULL log location not allowed")
+
+    /* Possibly fix up the log file name.
+     * The extra 39 characters are for adding the rank to the file name
+     * under parallel HDF5. 39 characters allows > 2^127 processes which
+     * should be enough for anybody.
+     *
+     * allocation size = <path length> + dot + <rank # length> + \0
+     */
+    n_chars = HDstrlen(log_location) + 1 + 39 + 1;
+    if(NULL == (file_name = (char *)HDcalloc(n_chars, sizeof(char))))
+        HGOTO_ERROR(H5E_RESOURCE, H5E_CANTALLOC, FAIL, \
+            "can't allocate memory for mdc log file name manipulation")
+
+#ifdef H5_HAVE_PARALLEL
+
+    /* Add the rank to the log file name when MPI is in use */
+    aux_ptr = (H5AC_aux_t *)(cache_ptr->aux_ptr);
+
+    if(NULL == aux_ptr) {
+        HDsnprintf(file_name, n_chars, "%s", log_location);
+    }
+    else {
+        if(aux_ptr->magic != H5AC__H5AC_AUX_T_MAGIC) {
+            HGOTO_ERROR(H5E_CACHE, H5E_SYSTEM, FAIL, "bad aux_ptr->magic")
+        }
+        HDsnprintf(file_name, n_chars, "%s.%d", log_location, aux_ptr->mpi_rank);
+    }
+
+#else /* H5_HAVE_PARALLEL */
+
+    HDsnprintf(file_name, n_chars, "%s", log_location);
+
+#endif /* H5_HAVE_PARALLEL */
+
+    /* Open log file */
+    if(NULL == (cache_ptr->log_file_ptr = HDfopen(file_name, "w")))
+        HGOTO_ERROR(H5E_FILE, H5E_CANTOPENFILE, FAIL, "can't create mdc log file")
+
+    /* Set logging flags */
+    cache_ptr->logging_enabled = TRUE;
+    cache_ptr->currently_logging = start_immediately;
+
+ done:
+
+    HDfree(file_name);
+
+    FUNC_LEAVE_NOAPI(ret_value)
+} /* H5C_set_up_logging() */
 
 
 /*-------------------------------------------------------------------------
- * Function:    H5C_get_trace_file_ptr_from_entry
+ * Function:    H5C_tear_down_logging
  *
- * Purpose:     Get the trace_file_ptr field from the cache, via an entry.
- *
- *              This field will either be NULL (which indicates that trace
- *              file logging is turned off), or contain a pointer to the
- *              open file to which trace file data is to be written.
+ * Purpose:     Tear-down for metadata cache logging.
  *
  * Return:      Non-negative on success/Negative on failure
- *
- * Programmer:  Quincey Koziol
- *              6/9/08
  *
  *-------------------------------------------------------------------------
  */
 herr_t
-H5C_get_trace_file_ptr_from_entry(const H5C_cache_entry_t *entry_ptr,
-    FILE **trace_file_ptr_ptr)
+H5C_tear_down_logging(H5C_t *cache_ptr)
 {
-    FUNC_ENTER_NOAPI_NOERR
+    herr_t ret_value = SUCCEED;      /* Return value */
+
+    FUNC_ENTER_NOAPI(FAIL)
+
+    HDassert(cache_ptr);
+    HDassert(cache_ptr->magic == H5C__H5C_T_MAGIC);
 
     /* Sanity checks */
-    HDassert(entry_ptr);
-    HDassert(entry_ptr->cache_ptr);
+    if(NULL == cache_ptr)
+        HGOTO_ERROR(H5E_ARGS, H5E_BADVALUE, FAIL, "cache_ptr == NULL")
 
-    H5C_get_trace_file_ptr(entry_ptr->cache_ptr, trace_file_ptr_ptr);
+    if(H5C__H5C_T_MAGIC != cache_ptr->magic)
+        HGOTO_ERROR(H5E_ARGS, H5E_BADVALUE, FAIL, "cache magic value incorrect")
 
-    FUNC_LEAVE_NOAPI(SUCCEED)
-} /* H5C_get_trace_file_ptr_from_entry() */
+    if(FALSE == cache_ptr->logging_enabled)
+        HGOTO_ERROR(H5E_CACHE, H5E_SYSTEM, FAIL, "logging not enabled")
+
+    /* Unset logging flags */
+    cache_ptr->logging_enabled = FALSE;
+    cache_ptr->currently_logging = FALSE;
+
+    /* Close log file */
+    if(EOF == HDfclose(cache_ptr->log_file_ptr))
+        HGOTO_ERROR(H5E_FILE, H5E_CANTCLOSEFILE, FAIL, "problem closing mdc log file")
+    cache_ptr->log_file_ptr = NULL;
+
+ done:
+
+    FUNC_LEAVE_NOAPI(ret_value)
+} /* H5C_tear_down_logging() */
+
+
+/*-------------------------------------------------------------------------
+ * Function:    H5C_start_logging
+ *
+ * Purpose:     Start logging metadata cache operations.
+ *
+ *              TODO: Add a function that dumps the current state of the
+ *                    metadata cache.
+ *
+ * Return:      Non-negative on success/Negative on failure
+ *
+ *-------------------------------------------------------------------------
+ */
+herr_t
+H5C_start_logging(H5C_t *cache_ptr)
+{
+    herr_t ret_value = SUCCEED;      /* Return value */
+
+    FUNC_ENTER_NOAPI(FAIL)
+
+    HDassert(cache_ptr);
+    HDassert(cache_ptr->magic == H5C__H5C_T_MAGIC);
+
+    /* Sanity checks */
+    if(NULL == cache_ptr)
+        HGOTO_ERROR(H5E_ARGS, H5E_BADVALUE, FAIL, "cache_ptr == NULL")
+
+    if(H5C__H5C_T_MAGIC != cache_ptr->magic)
+        HGOTO_ERROR(H5E_ARGS, H5E_BADVALUE, FAIL, "cache magic value incorrect")
+
+    if(FALSE == cache_ptr->logging_enabled)
+        HGOTO_ERROR(H5E_CACHE, H5E_SYSTEM, FAIL, "logging not enabled")
+
+    if(cache_ptr->currently_logging)
+        HGOTO_ERROR(H5E_CACHE, H5E_SYSTEM, FAIL, "logging already in progress")
+
+    /* Set logging flags */
+    cache_ptr->currently_logging = TRUE;
+
+    /* TODO - Dump cache state */
+
+ done:
+
+    FUNC_LEAVE_NOAPI(ret_value)
+} /* H5C_start_logging() */
+
+
+/*-------------------------------------------------------------------------
+ * Function:    H5C_stop_logging
+ *
+ * Purpose:     Stop logging metadata cache operations.
+ *
+ * Return:      Non-negative on success/Negative on failure
+ *
+ *-------------------------------------------------------------------------
+ */
+herr_t
+H5C_stop_logging(H5C_t *cache_ptr)
+{
+    herr_t ret_value = SUCCEED;      /* Return value */
+
+    FUNC_ENTER_NOAPI(FAIL)
+
+    HDassert(cache_ptr);
+    HDassert(cache_ptr->magic == H5C__H5C_T_MAGIC);
+
+    /* Sanity checks */
+    if(NULL == cache_ptr)
+        HGOTO_ERROR(H5E_ARGS, H5E_BADVALUE, FAIL, "cache_ptr == NULL")
+
+    if(H5C__H5C_T_MAGIC != cache_ptr->magic)
+        HGOTO_ERROR(H5E_ARGS, H5E_BADVALUE, FAIL, "cache magic value incorrect")
+
+    if(FALSE == cache_ptr->logging_enabled)
+        HGOTO_ERROR(H5E_CACHE, H5E_SYSTEM, FAIL, "logging not enabled")
+
+    if(FALSE == cache_ptr->currently_logging)
+        HGOTO_ERROR(H5E_CACHE, H5E_SYSTEM, FAIL, "logging not in progress")
+
+    /* Set logging flags */
+    cache_ptr->currently_logging = FALSE;
+
+ done:
+
+    FUNC_LEAVE_NOAPI(ret_value)
+} /* H5C_stop_logging() */
+
+
+/*-------------------------------------------------------------------------
+ * Function:    H5C_get_logging_status
+ *
+ * Purpose:     Determines if the cache is actively logging (via the OUT
+ *              parameter).
+ *
+ * Return:      Non-negative on success/Negative on failure
+ *
+ *-------------------------------------------------------------------------
+ */
+herr_t
+H5C_get_logging_status(const H5C_t *cache_ptr, /*OUT*/ hbool_t *is_enabled,
+                       /*OUT*/ hbool_t *is_currently_logging)
+{
+    herr_t ret_value = SUCCEED;      /* Return value */
+
+    FUNC_ENTER_NOAPI(FAIL)
+
+    HDassert(cache_ptr);
+    HDassert(cache_ptr->magic == H5C__H5C_T_MAGIC);
+    HDassert(is_enabled);
+    HDassert(is_currently_logging);
+
+    /* Sanity checks */
+    if(NULL == cache_ptr)
+        HGOTO_ERROR(H5E_ARGS, H5E_BADVALUE, FAIL, "cache_ptr == NULL")
+
+    if(H5C__H5C_T_MAGIC != cache_ptr->magic)
+        HGOTO_ERROR(H5E_ARGS, H5E_BADVALUE, FAIL, "cache magic value incorrect")
+
+    *is_enabled = cache_ptr->logging_enabled;
+    *is_currently_logging = cache_ptr->currently_logging;
+
+done:
+    FUNC_LEAVE_NOAPI(ret_value)
+} /* H5C_get_logging_status() */
+
+
+/*-------------------------------------------------------------------------
+ * Function:    H5C_write_log_message
+ *
+ * Purpose:     Write a message to the log file and flush the file. 
+ *              The message string is neither modified nor freed.
+ *
+ * Return:      Non-negative on success/Negative on failure
+ *
+ *-------------------------------------------------------------------------
+ */
+herr_t
+H5C_write_log_message(const H5C_t *cache_ptr, const char message[])
+{
+    size_t n_chars;
+    herr_t ret_value = SUCCEED;      /* Return value */
+
+    FUNC_ENTER_NOAPI(FAIL)
+
+    HDassert(cache_ptr);
+    HDassert(cache_ptr->magic == H5C__H5C_T_MAGIC);
+    HDassert(message);
+
+    /* Sanity checks */
+    if(NULL == cache_ptr)
+        HGOTO_ERROR(H5E_ARGS, H5E_BADVALUE, FAIL, "cache_ptr == NULL")
+
+    if(H5C__H5C_T_MAGIC != cache_ptr->magic)
+        HGOTO_ERROR(H5E_ARGS, H5E_BADVALUE, FAIL, "cache magic value incorrect")
+
+    if(FALSE == cache_ptr->currently_logging)
+        HGOTO_ERROR(H5E_CACHE, H5E_SYSTEM, FAIL, "not currently logging")
+
+    if(NULL == message)
+        HGOTO_ERROR(H5E_ARGS, H5E_BADVALUE, FAIL, "NULL log message not allowed")
+
+    /* Write the log message and flush */
+    n_chars = HDstrlen(message);
+    if((int)n_chars != HDfprintf(cache_ptr->log_file_ptr, message))
+        HGOTO_ERROR(H5E_FILE, H5E_WRITEERROR, FAIL, "error writing log message")
+    if(EOF == HDfflush(cache_ptr->log_file_ptr))
+        HGOTO_ERROR(H5E_FILE, H5E_WRITEERROR, FAIL, "error flushing log message")
+
+done:
+    FUNC_LEAVE_NOAPI(ret_value)
+} /* H5C_write_log_message() */
+
 
 
 /*-------------------------------------------------------------------------
@@ -2674,7 +2987,7 @@ H5C_insert_entry(H5F_t *             f,
 
         HGOTO_ERROR(H5E_CACHE, H5E_SYSTEM, FAIL, "thing already in index.\n");
     }
-#endif /* H5C_DO_SANITY_CHECKS */
+#endif /* H5C_DO_EXTREME_SANITY_CHECKS */
 
 #if H5C_DO_EXTREME_SANITY_CHECKS
     if ( H5C_validate_lru_list(cache_ptr) < 0 ) {
@@ -2723,6 +3036,10 @@ H5C_insert_entry(H5F_t *             f,
     /* Apply tag to newly inserted entry */
     if(H5C_tag_entry(cache_ptr, entry_ptr, primary_dxpl_id) < 0)
         HGOTO_ERROR(H5E_CACHE, H5E_CANTTAG, FAIL, "Cannot tag entry")
+
+    /* Set the entry's cork status */
+    if(H5C_cork(cache_ptr, entry_ptr->tag, H5C__GET_CORKED, &entry_ptr->is_corked) < 0)
+        HGOTO_ERROR(H5E_CACHE, H5E_SYSTEM, FAIL, "Cannot retrieve entry's cork status")
 
     entry_ptr->is_protected = FALSE;
     entry_ptr->is_read_only = FALSE;
@@ -3848,6 +4165,10 @@ H5C_protect(H5F_t *		f,
         if(H5C_tag_entry(cache_ptr, entry_ptr, primary_dxpl_id) < 0)
             HGOTO_ERROR(H5E_CACHE, H5E_CANTTAG, NULL, "Cannot tag entry")
 
+	/* Set the entry's cork status */
+	if(H5C_cork(cache_ptr, entry_ptr->tag, H5C__GET_CORKED, &entry_ptr->is_corked) < 0)
+	    HGOTO_ERROR(H5E_CACHE, H5E_SYSTEM, FAIL, "Cannot retrieve entry's cork status")
+
         /* If the entry is very large, and we are configured to allow it,
          * we may wish to perform a flash cache size increase.
          */
@@ -4564,13 +4885,13 @@ done:
 
 
 /*-------------------------------------------------------------------------
- * Function:    H5C_set_trace_file_ptr
+ * Function:    H5C_set_log_file_ptr
  *
- * Purpose:     Set the trace_file_ptr field for the cache.
+ * Purpose:     Set the log_file_ptr field for the cache.
  *
- *              This field must either be NULL (which turns of trace
- *              file logging), or be a pointer to an open file to which
- *              trace file data is to be written.
+ *              This field must either be NULL (which turns of metadata
+ *              cache logging), or be a pointer to an open file to which
+ *              log entries are to be written.
  *
  * Return:      Non-negative on success/Negative on failure
  *
@@ -4580,8 +4901,8 @@ done:
  *-------------------------------------------------------------------------
  */
 herr_t
-H5C_set_trace_file_ptr(H5C_t * cache_ptr,
-                       FILE * trace_file_ptr)
+H5C_set_log_file_ptr(H5C_t * cache_ptr,
+                       FILE * log_file_ptr)
 {
     herr_t		ret_value = SUCCEED;   /* Return value */
 
@@ -4595,12 +4916,12 @@ H5C_set_trace_file_ptr(H5C_t * cache_ptr,
         HGOTO_ERROR(H5E_CACHE, H5E_SYSTEM, FAIL, "Bad cache_ptr")
     }
 
-    cache_ptr->trace_file_ptr = trace_file_ptr;
+    cache_ptr->log_file_ptr = log_file_ptr;
 
 done:
     FUNC_LEAVE_NOAPI(ret_value)
 
-} /* H5C_set_trace_file_ptr() */
+} /* H5C_set_log_file_ptr() */
 
 
 /*-------------------------------------------------------------------------
@@ -5241,7 +5562,7 @@ H5C_dump_cache(H5C_t * cache_ptr,
 
     HDfprintf(stdout, "\n\nDump of metadata cache \"%s\".\n", cache_name);
     HDfprintf(stdout,
-        "Num:   Addr:           Len:    Type:   Prot:   Pinned: Dirty:\n");
+        "Num:    Addr:                             Tag:         Len:    Type:   Prot:   Pinned: Dirty: Corked:\n");
 
     i = 0;
 
@@ -5261,14 +5582,16 @@ H5C_dump_cache(H5C_t * cache_ptr,
         HDassert( entry_ptr->magic == H5C__H5C_CACHE_ENTRY_T_MAGIC );
 
         HDfprintf(stdout,
-            "%s%d       0x%08llx        0x%3llx %2d     %d      %d      %d\n",
+            "%s%d       0x%16llx                0x%3llx        0x%3llx      %2d     %d      %d      %d       %d\n",
              cache_ptr->prefix, i,
              (long long)(entry_ptr->addr),
+             (long long)(entry_ptr->tag),
              (long long)(entry_ptr->size),
              (int)(entry_ptr->type->id),
              (int)(entry_ptr->is_protected),
              (int)(entry_ptr->is_pinned),
-             (int)(entry_ptr->is_dirty));
+             (int)(entry_ptr->is_dirty),
+	     (int)(entry_ptr->is_corked));
 
         /* increment node_ptr before we delete its target */
         node_ptr = H5SL_next(node_ptr);
@@ -6950,6 +7273,7 @@ H5C__autoadjust__ageout__evict_aged_out_entries(H5F_t * f,
                 ( (entry_ptr->type)->id != H5C__EPOCH_MARKER_TYPE ) &&
                 ( bytes_evicted < eviction_size_limit ) )
         {
+	    hbool_t		corked = FALSE;
             HDassert( ! (entry_ptr->is_protected) );
 
 	    next_ptr = entry_ptr->next;
@@ -6960,7 +7284,11 @@ H5C__autoadjust__ageout__evict_aged_out_entries(H5F_t * f,
                 prev_is_dirty = prev_ptr->is_dirty;
             }
 
-            if ( entry_ptr->is_dirty ) {
+	    /* dirty corked entry is skipped */
+	    if(entry_ptr->is_corked && entry_ptr->is_dirty) {
+		corked = TRUE;
+		result = TRUE;
+            } else if ( entry_ptr->is_dirty ) {
 
                 result = H5C_flush_single_entry(f,
                                                 primary_dxpl_id,
@@ -7000,9 +7328,11 @@ H5C__autoadjust__ageout__evict_aged_out_entries(H5F_t * f,
                     HGOTO_ERROR(H5E_CACHE, H5E_SYSTEM, FAIL, \
                                 "*prev_ptr corrupt")
 
-                } else
+                }
 #endif /* NDEBUG */
-		if ( ( prev_ptr->is_dirty != prev_is_dirty )
+		if(corked) { /* dirty corked entry is skipped */
+                    entry_ptr = prev_ptr;
+		} else if ( ( prev_ptr->is_dirty != prev_is_dirty )
                          ||
                          ( prev_ptr->next != next_ptr )
                          ||
@@ -8723,6 +9053,7 @@ H5C_make_space_in_cache(H5F_t *	f,
     H5C_cache_entry_t *	entry_ptr;
     H5C_cache_entry_t *	prev_ptr;
     H5C_cache_entry_t *	next_ptr;
+    int32_t 		num_corked_entries = 0;
     herr_t		ret_value = SUCCEED;      /* Return value */
 
     FUNC_ENTER_NOAPI_NOINIT
@@ -8751,7 +9082,7 @@ H5C_make_space_in_cache(H5F_t *	f,
 
 	}
 
-        while ( ( ( (cache_ptr->index_size + space_needed)
+         while ( ( ( (cache_ptr->index_size + space_needed)
                     >
                     cache_ptr->max_cache_size
                   )
@@ -8768,7 +9099,7 @@ H5C_make_space_in_cache(H5F_t *	f,
                 ( entry_ptr != NULL )
               )
         {
-            HDassert( ! (entry_ptr->is_protected) );
+            HDassert( !(entry_ptr->is_protected) );
             HDassert( ! (entry_ptr->is_read_only) );
             HDassert( (entry_ptr->ro_ref_count) == 0 );
 
@@ -8779,8 +9110,21 @@ H5C_make_space_in_cache(H5F_t *	f,
 
 		prev_is_dirty = prev_ptr->is_dirty;
 	    }
+            if ( (entry_ptr->type)->id == H5C__EPOCH_MARKER_TYPE) {
 
-            if ( (entry_ptr->type)->id != H5C__EPOCH_MARKER_TYPE ) {
+                /* Skip epoch markers.  Set result to SUCCEED to avoid
+                 * triggering the error code below.
+                 */
+                didnt_flush_entry = TRUE;
+                result = SUCCEED;
+	    } else if (entry_ptr->is_corked && entry_ptr->is_dirty) {
+                /* Skip "dirty" corked entries.  Set result to SUCCEED to avoid
+                 * triggering the error code below.
+                 */
+		++num_corked_entries;
+                didnt_flush_entry = TRUE;
+                result = SUCCEED;
+	    } else {
 
                 didnt_flush_entry = FALSE;
 
@@ -8836,14 +9180,7 @@ H5C_make_space_in_cache(H5F_t *	f,
 #endif /* H5C_COLLECT_CACHE_STATS */
 
 
-            } else {
-
-                /* Skip epoch markers.  Set result to SUCCEED to avoid
-                 * triggering the error code below.
-                 */
-                didnt_flush_entry = TRUE;
-                result = SUCCEED;
-            }
+            } 
 
             if ( result < 0 ) {
 
@@ -8930,12 +9267,14 @@ H5C_make_space_in_cache(H5F_t *	f,
         }
 #endif /* H5C_COLLECT_CACHE_STATS */
 
+
+	/* NEED: work on a better assert for corked entries */
 	HDassert( ( entries_examined > (2 * initial_list_len) ) ||
 		  ( (cache_ptr->pl_size + cache_ptr->pel_size + cache_ptr->min_clean_size) >
 		    cache_ptr->max_cache_size ) ||
 		  ( ( cache_ptr->clean_index_size + empty_space )
-		    >= cache_ptr->min_clean_size ) );
-
+		    >= cache_ptr->min_clean_size ) ||
+		  ( ( num_corked_entries )));
 #if H5C_MAINTAIN_CLEAN_AND_DIRTY_LRU_LISTS
 
         HDassert( ( entries_examined > (2 * initial_list_len) ) ||
@@ -9605,6 +9944,148 @@ H5C_retag_entries(H5C_t * cache_ptr, haddr_t src_tag, haddr_t dest_tag)
 
     FUNC_LEAVE_NOAPI_VOID
 } /* H5C_retag_entries */
+
+
+/*-------------------------------------------------------------------------
+ *
+ * Function:    H5C_cork
+ *
+ * Purpose:     To cork/uncork/get cork status of an object depending on "action":
+ *		H5C__SET_CORK: 
+ *			To cork the object
+ *			Return error if the object is already corked
+ *		H5C__UNCORK:
+ *			To uncork the obejct
+ *			Return error if the object is not corked
+ * 		H5C__GET_CORKED:
+ *			To retrieve the cork status of an object in
+ *			the parameter "corked"
+ *		
+ * Return:      Success:        Non-negative
+ *              Failure:        Negative
+ *
+ * Programmer:  Vailin Choi; January 2014
+ *
+ *-------------------------------------------------------------------------
+ */
+herr_t
+H5C_cork(H5C_t * cache_ptr, haddr_t obj_addr, unsigned action, hbool_t *corked) 
+{
+    haddr_t *ptr;		/* Points to an address */
+    haddr_t *addr_ptr = NULL;	/* Points to an address */
+    hbool_t is_corked;		/* Cork status for an entry */
+    herr_t ret_value = SUCCEED;	/* Return value */
+
+    FUNC_ENTER_NOAPI_NOINIT
+
+    /* Assertions */
+    HDassert(cache_ptr != NULL);
+    HDassert(H5F_addr_defined(obj_addr));
+    HDassert(action == H5C__SET_CORK || action == H5C__UNCORK || action == H5C__GET_CORKED);
+
+    /* Search the list of corked object addresses in the cache */
+    ptr = (haddr_t *)H5SL_search(cache_ptr->cork_list_ptr, &obj_addr);
+
+    switch(action) {
+	case H5C__SET_CORK:
+	    if(ptr != NULL && *ptr == obj_addr)
+		HGOTO_ERROR(H5E_CACHE, H5E_SYSTEM, FAIL, "Can't cork an already corked object")
+
+	    /* Allocate address */
+	    if(NULL == (addr_ptr = H5FL_MALLOC(haddr_t)))
+		HGOTO_ERROR(H5E_RESOURCE, H5E_NOSPACE, FAIL, "memory allocation failed")
+
+	    /* Insert into the list */
+	    *addr_ptr = obj_addr;
+	    if(H5SL_insert(cache_ptr->cork_list_ptr, addr_ptr, addr_ptr) < 0)
+		HGOTO_ERROR(H5E_CACHE, H5E_SYSTEM, FAIL, "Can't insert address into cork list")
+
+	    /* Set the entry's cork status */
+	    is_corked = TRUE;
+
+	    break;
+
+	case H5C__UNCORK:
+	    if(ptr == NULL)
+		HGOTO_ERROR(H5E_CACHE, H5E_SYSTEM, FAIL, "Can't uncork an object that is not corked ")
+
+	    /* Remove the object address from the list */
+	    ptr = (haddr_t *)H5SL_remove(cache_ptr->cork_list_ptr, &obj_addr);
+	    if(ptr == NULL || *ptr != obj_addr)
+		HGOTO_ERROR(H5E_CACHE, H5E_SYSTEM, FAIL, "Can't remove address from list")
+
+	    /* Set the entry's cork status */
+	    is_corked = FALSE;
+	    break;
+
+	case H5C__GET_CORKED:
+	    HDassert(corked);
+	    if(ptr != NULL && *ptr == obj_addr)
+		*corked = TRUE;
+	    else
+		*corked = FALSE;
+	    break;
+
+	default: /* should be unreachable */
+	    HGOTO_ERROR(H5E_CACHE, H5E_SYSTEM, FAIL, "Unknown cork action")
+                break;
+    } /* end switch */
+
+    if(action != H5C__GET_CORKED)
+	/* Mark existing cache entries with tag (obj_addr) to the cork status */
+	if(H5C_mark_tagged_entries_cork(cache_ptr, obj_addr, is_corked) < 0)
+	    HGOTO_ERROR(H5E_CACHE, H5E_SYSTEM, FAIL, "Unknown cork action")
+
+done:
+    FUNC_LEAVE_NOAPI(ret_value)
+} /* H5C_cork() */
+
+
+/*-------------------------------------------------------------------------
+ * Function:    H5C_mark_tagged_entries_cork
+ *		
+ *		NEED: work to combine with H5C_mark_tagged_entries()--
+ *		      probably an action (FLUSH or CORK) with hbool_t clean_or_cork
+ *
+ * Purpose:     To set the "is_corked" field to "val" for entries in cache 
+ *		with the entry's tag equals to "obj_addr".
+ *
+ * Return:      FAIL if error is detected, SUCCEED otherwise.
+ *
+ * Programmer:  Vailin Choi; January 2014
+ *
+ *-------------------------------------------------------------------------
+ */
+static herr_t 
+H5C_mark_tagged_entries_cork(H5C_t *cache_ptr, haddr_t obj_addr, hbool_t val)
+{
+    /* Variable Declarations */
+    int u;                          /* Iterator */
+    H5C_cache_entry_t *entry_ptr = NULL; /* entry pointer */
+
+    FUNC_ENTER_NOAPI_NOINIT_NOERR
+
+    /* Assertions */
+    HDassert(cache_ptr != NULL);
+    HDassert(cache_ptr->magic == H5C__H5C_T_MAGIC);
+
+    /* Iterate through entries, find each entry with the specified tag */
+    /* and set the entry's "corked" field to "val" */
+    for(u = 0; u < H5C__HASH_TABLE_LEN; u++) {
+
+        entry_ptr = cache_ptr->index[u];
+
+        while(entry_ptr != NULL) {
+
+            if(entry_ptr->tag == obj_addr)
+		entry_ptr->is_corked = val;
+
+            entry_ptr = entry_ptr->ht_next;
+        } /* end while */
+    } /* end for */
+
+    FUNC_LEAVE_NOAPI(SUCCEED)
+} /* H5C_mark_tagged_entries_cork */
 
 
 /*-------------------------------------------------------------------------

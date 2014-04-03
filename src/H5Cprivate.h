@@ -141,6 +141,12 @@ typedef enum {
 #define H5C_CALLBACK__SIZE_CHANGED_FLAG		0x1
 #define H5C_CALLBACK__MOVED_FLAG		0x2
 
+/* Cork actions: cork/uncork/get cork status of an object */
+#define H5C__SET_CORK                  0x1
+#define H5C__UNCORK                    0x2
+#define H5C__GET_CORKED                0x4
+
+
 /* Actions that can be reported to 'notify' client callback */
 typedef enum H5C_notify_action_t {
     H5C_NOTIFY_ACTION_AFTER_INSERT,     /* Entry has been added to the cache */
@@ -274,6 +280,9 @@ typedef herr_t (*H5C_log_flush_func_t)(H5C_t * cache_ptr,
  *
  *		The name is not particularly descriptive, but is retained
  *		to avoid changes in existing code.
+ *
+ * is_corked:	Boolean flag indicating whether the cache entry associated
+ *		with an object is corked or not corked.
  *
  * is_dirty:	Boolean flag indicating whether the contents of the cache
  *		entry has been modified since the last time it was written
@@ -600,6 +609,7 @@ typedef struct H5C_cache_entry_t
     const H5C_class_t *		type;
     haddr_t		        tag;
     int	    	    globality;
+    hbool_t			is_corked;
     hbool_t			is_dirty;
     hbool_t			dirtied;
     hbool_t			is_protected;
@@ -1095,6 +1105,24 @@ H5_DLL H5C_t * H5C_create(size_t                     max_cache_size,
                           H5C_log_flush_func_t       log_flush,
                           void *                     aux_ptr);
 
+H5_DLL herr_t H5C_set_up_logging(H5C_t *cache_ptr,
+                                 const char log_location[],
+                                 hbool_t start_immediately);
+
+H5_DLL herr_t H5C_tear_down_logging(H5C_t *cache_ptr);
+
+H5_DLL herr_t H5C_start_logging(H5C_t *cache_ptr);
+
+H5_DLL herr_t H5C_stop_logging(H5C_t *cache_ptr);
+
+H5_DLL herr_t H5C_get_logging_status(const H5C_t *cache_ptr,
+                                     /*OUT*/ hbool_t *is_enabled,
+                                     /*OUT*/ hbool_t *is_currently_logging);
+
+H5_DLL herr_t H5C_write_log_message(const H5C_t *cache_ptr,
+                                    const char message[]);
+
+
 H5_DLL void H5C_def_auto_resize_rpt_fcn(H5C_t * cache_ptr,
                                         int32_t version,
                                         double hit_rate,
@@ -1156,16 +1184,12 @@ H5_DLL herr_t H5C_get_entry_status(const H5F_t *f,
                                    hbool_t * is_dirty_ptr,
                                    hbool_t * is_protected_ptr,
 				   hbool_t * is_pinned_ptr,
+				   hbool_t * is_corked_ptr,
 				   hbool_t * is_flush_dep_parent_ptr,
 				   hbool_t * is_flush_dep_child_ptr);
 
 H5_DLL herr_t H5C_get_evictions_enabled(const H5C_t * cache_ptr,
                                         hbool_t * evictions_enabled_ptr);
-
-H5_DLL herr_t H5C_get_trace_file_ptr(const H5C_t *cache_ptr,
-    FILE **trace_file_ptr_ptr);
-H5_DLL herr_t H5C_get_trace_file_ptr_from_entry(const H5C_cache_entry_t *entry_ptr,
-    FILE **trace_file_ptr_ptr);
 
 H5_DLL herr_t H5C_insert_entry(H5F_t *             f,
                                hid_t               primary_dxpl_id,
@@ -1212,8 +1236,8 @@ H5_DLL herr_t H5C_set_evictions_enabled(H5C_t *cache_ptr,
 
 H5_DLL herr_t H5C_set_prefix(H5C_t * cache_ptr, char * prefix);
 
-H5_DLL herr_t H5C_set_trace_file_ptr(H5C_t * cache_ptr,
-		                     FILE * trace_file_ptr);
+H5_DLL herr_t H5C_set_log_file_ptr(H5C_t * cache_ptr,
+		                     FILE * log_file_ptr);
 
 H5_DLL herr_t H5C_stats(H5C_t * cache_ptr,
                         const char * cache_name,
@@ -1242,6 +1266,8 @@ H5_DLL herr_t H5C_validate_resize_config(H5C_auto_size_ctl_t * config_ptr,
 H5_DLL herr_t H5C_ignore_tags(H5C_t * cache_ptr);
 
 H5_DLL void H5C_retag_entries(H5C_t * cache_ptr, haddr_t src_tag, haddr_t dest_tag);
+
+H5_DLL herr_t H5C_cork(H5C_t *cache_ptr, haddr_t obj_addr, unsigned action, hbool_t *corked);
 
 #endif /* !_H5Cprivate_H */
 

@@ -971,6 +971,10 @@ H5F_new(H5F_file_t *shared, unsigned flags, hid_t fcpl_id, hid_t fapl_id, H5FD_t
             HGOTO_ERROR(H5E_PLIST, H5E_CANTGET, NULL, "can't get sieve buffer size")
         if(H5P_get(plist, H5F_ACS_LATEST_FORMAT_NAME, &(f->shared->latest_format)) < 0)
             HGOTO_ERROR(H5E_PLIST, H5E_CANTGET, NULL, "can't get 'latest format' flag")
+        if(H5P_get(plist, H5F_ACS_USE_MDC_LOGGING_NAME, &(f->shared->use_mdc_logging)) < 0)
+            HGOTO_ERROR(H5E_PLIST, H5E_CANTGET, NULL, "can't get 'use mdc logging' flag")
+        if(H5P_get(plist, H5F_ACS_START_MDC_LOG_ON_ACCESS_NAME, &(f->shared->start_mdc_log_on_access)) < 0)
+            HGOTO_ERROR(H5E_PLIST, H5E_CANTGET, NULL, "can't get 'start mdc log on access' flag")
         /* Require the latest format to use SWMR */
         /* (Need to revisit this when the 1.10 release is made, and require
          *      1.10 or later -QAK)
@@ -1037,6 +1041,22 @@ H5F_new(H5F_file_t *shared, unsigned flags, hid_t fcpl_id, hid_t fapl_id, H5FD_t
 	/* Determine the # of bins for metdata read retries */
 	if(H5F_set_retries(f) < 0)
 	    HGOTO_ERROR(H5E_FILE, H5E_CANTINIT, NULL, "can't set retries and retries_nbins")
+
+        /* Get the metadata cache log location (if we're logging) */
+        {
+            char *mdc_log_location = NULL;      /* location of metadata cache log location */
+
+            if(H5P_get(plist, H5F_ACS_MDC_LOG_LOCATION_NAME, &mdc_log_location) < 0)
+                HGOTO_ERROR(H5E_PLIST, H5E_CANTGET, NULL, "can't get mdc log location")
+            if(mdc_log_location != NULL) {
+                size_t len = HDstrlen(mdc_log_location);
+                if(NULL == (f->shared->mdc_log_location = HDcalloc(len + 1, sizeof(char))))
+                    HGOTO_ERROR(H5E_RESOURCE, H5E_CANTALLOC, NULL, "can't allocate memory for mdc log file name")
+                HDstrncpy(f->shared->mdc_log_location, mdc_log_location, len);
+            }
+            else
+                f->shared->mdc_log_location = NULL;
+        }
 
 	/* Get object flush callback information */
 	if(H5P_get(plist, H5F_ACS_OBJECT_FLUSH_CB_NAME, &(f->shared->object_flush)) < 0)
@@ -1181,6 +1201,10 @@ H5F_dest(H5F_t *f, hid_t dxpl_id, hbool_t flush)
         if(H5AC_dest(f, dxpl_id))
             /* Push error, but keep going*/
             HDONE_ERROR(H5E_FILE, H5E_CANTRELEASE, FAIL, "problems closing file")
+
+        /* Clean up the metadata cache log location string */
+        if(f->shared->mdc_log_location)
+            HDfree(f->shared->mdc_log_location);
 
         /*
          * Do not close the root group since we didn't count it, but free
@@ -1488,7 +1512,7 @@ H5F_open(const char *name, unsigned flags, hid_t fcpl_id, hid_t fapl_id,
     } else if (1 == shared->nrefs) {
 
 	/* Read the superblock if it hasn't been read before. */
-        if(H5F_super_read(file, dxpl_id) < 0)
+        if(H5F_super_read(file, dxpl_id, TRUE) < 0)
 	    HGOTO_ERROR(H5E_FILE, H5E_READERROR, NULL, "unable to read superblock")
 
 	/* Open the root group */
@@ -3708,22 +3732,33 @@ H5F_set_retries(H5F_t *f)
  * Function:	H5Fstart_swmr_write
  *
  * Purpose:	To enable SWMR writing mode for the file
- *		1) Mark the file in SWMR writing mode
- *	 	2) Set metadata read attempts and retries info
- *		3) Disable accumulator
- *		4) Flush the data buffers
- *		5) Evict all cache entries except the superblock
- *		6) Unlock the file
- *		Fail when:
- *		1) There are opened objects 
- *		2) The file is not opened with latest library format
- *		3) The file is not opened with H5F_ACC_RDWR
- *		4) The file is already marked for SWMR writing
+ *		1) Refresh opened objects: part 1
+ *		2) Flush & reset accumulator
+ *		3) Mark the file in SWMR writing mode
+ *	 	4) Set metadata read attempts and retries info
+ *		5) Disable accumulator
+ *		6) Evict all cache entries except the superblock
+ *		7) Refresh opened objects (part 2)
+ *		8) Unlock the file
  *
+ *		Pre-conditions:
+ *		1) The file is opened with latest library format
+ *		2) The file is opened with H5F_ACC_RDWR
+ *		3) The file is not already marked for SWMR writing
+ *		4) Current implementaion for opened objects:
+ *		   --only allow datasets and groups without attributes
+ *		   --disallow named datatype with/without attributes
+ *		   --disallow opened attributes attached to objects
+ *		NOTE: Currently, only opened groups and datasets are allowed
+ *	      	when enabling SWMR via H5Fstart_swmr_write().
+ *	      	Will later implement a different approach--
+ *	      	set up flush dependency/proxy even for file opened without
+ *	      	SWMR to resolve issues with opened objects.
+ *	
  * Return:	Non-negative on success/negative on failure
  *
  * Programmer:	
- *	Vailin Choi; Dec 2013
+ *	Vailin Choi; Feb 2014
  *
  *-------------------------------------------------------------------------
  */
@@ -3731,7 +3766,14 @@ herr_t
 H5Fstart_swmr_write(hid_t file_id)
 {
     H5F_t *file;                /* File info */
-    hbool_t setup = FALSE;
+    size_t grp_dset_count=0; 	/* # of open objects: groups & datasets */
+    size_t nt_attr_count=0; 	/* # of opened named datatypes  + opened attributes */
+    hid_t *obj_ids=NULL;	/* List of ids */
+    H5G_loc_t *obj_glocs=NULL;	/* Group location of the object */
+    H5O_loc_t *obj_olocs=NULL;	/* Object location */
+    H5G_name_t *obj_paths=NULL;	/* Group hierarchy path */
+    size_t u;               	/* Local index variable */
+    hbool_t setup = FALSE;	/* Boolean flag to indicate whether SWMR setting is enabled */
     herr_t ret_value = SUCCEED;	/* Return value */
 
     FUNC_ENTER_API(FAIL)
@@ -3740,12 +3782,6 @@ H5Fstart_swmr_write(hid_t file_id)
     /* check args */
     if(NULL == (file = (H5F_t *)H5I_object_verify(file_id, H5I_FILE)))
 	HGOTO_ERROR(H5E_ARGS, H5E_BADTYPE, FAIL, "not a file")
-
-    /* ???How about nopen_files from (H5F_mount_count_ids(file, &nopen_files, &nopen_objs) */
-    /* For now, just check nopen_objs */
-    if((H5F_addr_defined(file->shared->sblock->ext_addr) && file->nopen_objs > 1) || 
-       (!H5F_addr_defined(file->shared->sblock->ext_addr) && file->nopen_objs > 0))
-	HGOTO_ERROR(H5E_FILE, H5E_CANTCLOSEFILE, FAIL, "can't start SWMR writing, there are objects still open")
 
     /* Should have write permission */
     if((H5F_INTENT(file) & H5F_ACC_RDWR) == 0)
@@ -3761,6 +3797,60 @@ H5Fstart_swmr_write(hid_t file_id)
 
     HDassert(file->shared->sblock->status_flags & H5F_SUPER_WRITE_ACCESS);
 
+    /* Flush data buffers */
+    if(H5F_flush(file, H5AC_dxpl_id, FALSE) < 0)
+        HGOTO_ERROR(H5E_FILE, H5E_CANTFLUSH, FAIL, "unable to flush file's cached information")
+
+    /* Get the # of opened named datatypes and attributes */
+    if(H5F_get_obj_count(file, H5F_OBJ_LOCAL|H5F_OBJ_DATATYPE|H5F_OBJ_ATTR, FALSE, &nt_attr_count) < 0)
+        HGOTO_ERROR(H5E_INTERNAL, H5E_BADITER, FAIL, "H5F_get_obj_count failed")
+    if(nt_attr_count)
+	HGOTO_ERROR(H5E_FILE, H5E_BADVALUE, FAIL, "named datatypes and/or attributes opened in the file")
+
+    /* Get the # of opened datasets and groups */
+    if(H5F_get_obj_count(file, H5F_OBJ_LOCAL|H5F_OBJ_GROUP|H5F_OBJ_DATASET, FALSE, &grp_dset_count) < 0)
+        HGOTO_ERROR(H5E_INTERNAL, H5E_BADITER, FAIL, "H5F_get_obj_count failed")
+
+    /* Allocate space for group and object locations */
+    if(grp_dset_count) {
+	if((obj_ids = (hid_t *) H5MM_malloc(grp_dset_count * sizeof(hid_t))) == NULL)
+	    HGOTO_ERROR(H5E_FILE, H5E_NOSPACE, FAIL, "can't allocate buffer for hid_t")
+	if((obj_glocs = (H5G_loc_t *) H5MM_malloc(grp_dset_count * sizeof(H5G_loc_t))) == NULL)
+	    HGOTO_ERROR(H5E_FILE, H5E_NOSPACE, FAIL, "can't allocate buffer for H5G_loc_t")
+	if((obj_olocs = (H5O_loc_t *) H5MM_malloc(grp_dset_count * sizeof(H5O_loc_t))) == NULL)
+	    HGOTO_ERROR(H5E_FILE, H5E_NOSPACE, FAIL, "can't allocate buffer for H5O_loc_t")
+	if((obj_paths = (H5G_name_t *) H5MM_malloc(grp_dset_count * sizeof(H5G_name_t))) == NULL)
+	    HGOTO_ERROR(H5E_FILE, H5E_NOSPACE, FAIL, "can't allocate buffer for H5G_name_t")
+    }
+
+    /* Get the list of opened object ids (groups & datasets) */
+    if(grp_dset_count) {
+	if(H5F_get_obj_ids(file, H5F_OBJ_LOCAL|H5F_OBJ_GROUP|H5F_OBJ_DATASET, grp_dset_count, obj_ids, FALSE, &grp_dset_count) < 0)
+	    HGOTO_ERROR(H5E_FILE, H5E_CANTGET, FAIL, "H5F_get_obj_ids failed")
+    }
+
+    /* Refresh opened objects (groups, datasets) in the file */
+    for(u = 0; u < grp_dset_count; u++) {
+	H5O_loc_t *oloc;            /* object location */
+
+	/* Set up the id's group location */
+	obj_glocs[u].oloc = &obj_olocs[u];
+	obj_glocs[u].path = &obj_paths[u];
+	H5G_loc_reset(&obj_glocs[u]);
+
+	/* get the id's object location */
+	if((oloc = H5O_get_loc(obj_ids[u])) == NULL)
+	    HGOTO_ERROR(H5E_ARGS, H5E_BADTYPE, FAIL, "not an object")
+
+	/* Refresh (part 1) */
+	if(H5O_refresh_metadata_close(obj_ids[u], *oloc, &obj_glocs[u], H5AC_dxpl_id) < 0)
+	    HGOTO_ERROR(H5E_ATOM, H5E_CLOSEERROR, FAIL, "can't refresh-close object")
+    }
+
+    /* Flush and reset the accumulator */
+    if(H5F_accum_reset(file, H5AC_dxpl_id, TRUE) < 0)
+        HGOTO_ERROR(H5E_IO, H5E_CANTRESET, FAIL, "can't reset accumulator")
+
     /* Turn on SWMR write in shared file open flags */
     file->shared->flags |= H5F_ACC_SWMR_WRITE;
 
@@ -3770,38 +3860,41 @@ H5Fstart_swmr_write(hid_t file_id)
     /* Set up metadata read attempts */
     file->shared->read_attempts = H5F_SWMR_METADATA_READ_ATTEMPTS;
 
-    setup = TRUE;
-
     /* Initialize "retries" and "retries_nbins" */
     if(H5F_set_retries(file) < 0)
 	HGOTO_ERROR(H5E_FILE, H5E_CANTINIT, FAIL, "can't set retries and retries_nbins")
 
-    /* Flush and reset the accumulator */
-    if(H5F_accum_reset(file, H5AC_dxpl_id, TRUE) < 0)
-	HGOTO_ERROR(H5E_IO, H5E_CANTRESET, FAIL, "can't reset accumulator")
-
     /* Turn off usage of accumulator */
     file->shared->feature_flags &= ~(unsigned)H5FD_FEAT_ACCUMULATE_METADATA;
     if(H5FD_set_feature_flags(file->shared->lf, file->shared->feature_flags) < 0)
-	HGOTO_ERROR(H5E_FILE, H5E_CANTSET, FAIL, "can't set feature_flags in VFD")
+        HGOTO_ERROR(H5E_FILE, H5E_CANTSET, FAIL, "can't set feature_flags in VFD")
+
+    setup = TRUE;
 
     /* Mark superblock as dirty */
     if(H5F_super_dirty(file) < 0)
 	HGOTO_ERROR(H5E_FILE, H5E_CANTMARKDIRTY, FAIL, "unable to mark superblock as dirty")
 
-    /* Flush data buffers */
-    if(H5F_flush(file, H5AC_dxpl_id, FALSE) < 0)
-	HGOTO_ERROR(H5E_FILE, H5E_CANTFLUSH, FAIL, "unable to flush file's cached information")
+    /* Flush the superblock */
+    if(H5F_flush_tagged_metadata(file, (haddr_t)0, H5AC_dxpl_id) < 0)
+	HDONE_ERROR(H5E_FILE, H5E_CANTFLUSH, FAIL, "unable to flush superblock")
 
     /* Evict all flushed entries in the cache except the pinned superblock */
     if(H5F_evict_cache_entries(file, H5AC_dxpl_id) < 0)
 	HGOTO_ERROR(H5E_FILE, H5E_CANTFLUSH, FAIL, "unable to evict file's cached information")
 
+    /* Refresh (part 2: reopen) the objects (groups & datasets) in the file */
+    for(u = 0; u < grp_dset_count; u++) {
+	if(H5O_refresh_metadata_reopen(obj_ids[u], &obj_glocs[u], H5AC_dxpl_id) < 0)
+	    HGOTO_ERROR(H5E_ATOM, H5E_CLOSEERROR, FAIL, "can't refresh-close object")
+    }
+
     /* Unlock the file */
     if(H5FD_unlock(file->shared->lf) < 0)
 	HGOTO_ERROR(H5E_FILE, H5E_CANTOPENFILE, FAIL, "unable to unlock the file")
 done:
-    if(ret_value < 0 && file && setup) {
+    if(ret_value < 0 && setup) {
+	HDassert(file);
 
 	/* Re-enable accumulator */
 	file->shared->feature_flags |= (unsigned)H5FD_FEAT_ACCUMULATE_METADATA;
@@ -3827,8 +3920,19 @@ done:
 	if(H5F_flush_tagged_metadata(file, (haddr_t)0, H5AC_dxpl_id) < 0)
 	    HDONE_ERROR(H5E_FILE, H5E_CANTFLUSH, FAIL, "unable to flush superblock")
     }
+    /* Free memory */
+    if(obj_ids)
+	H5MM_xfree(obj_ids);
+    if(obj_glocs)
+	H5MM_xfree(obj_glocs);
+    if(obj_olocs)
+	H5MM_xfree(obj_olocs);
+    if(obj_paths)
+	H5MM_xfree(obj_paths);
+
     FUNC_LEAVE_API(ret_value)
 } /* end H5Fstart_swmr_write() */
+
 
 /*-------------------------------------------------------------------------
  * Function:    H5F_object_flush_cb
@@ -3861,3 +3965,106 @@ H5F_object_flush_cb(H5F_t *f, hid_t obj_id)
 done:
     FUNC_LEAVE_NOAPI(ret_value)
 } /* H5F_object_flush_cb() */
+
+
+/*-------------------------------------------------------------------------
+ * Function:    H5Fstart_mdc_logging
+ *
+ * Purpose:     Start metadata cache logging operations for a file.
+ *                  - Logging must have been set up via the fapl.
+ *
+ * Return:      Non-negative on success/Negative on errors
+ *
+ *-------------------------------------------------------------------------
+ */
+herr_t
+H5Fstart_mdc_logging(hid_t file_id)
+{
+    H5F_t *file;                /* File info */
+    herr_t ret_value = SUCCEED;	/* Return value */
+
+    FUNC_ENTER_API(FAIL)
+    H5TRACE1("e", "i", file_id);
+
+    /* Sanity check */
+    if(NULL == (file = (H5F_t *)H5I_object_verify(file_id, H5I_FILE)))
+	HGOTO_ERROR(H5E_ARGS, H5E_BADTYPE, FAIL, "hid_t identifier is not a file ID")
+
+    /* Call mdc logging function */
+    if(H5C_start_logging(file->shared->cache) < 0)
+        HGOTO_ERROR(H5E_CACHE, H5E_LOGFAIL, FAIL, "unable to start mdc logging")
+
+done:
+    FUNC_LEAVE_API(ret_value)
+
+} /* H5Fstart_mdc_logging() */
+
+
+/*-------------------------------------------------------------------------
+ * Function:    H5Fstop_mdc_logging
+ *
+ * Purpose:     Stop metadata cache logging operations for a file.
+ *                  - Does not close the log file.
+ *                  - Logging must have been set up via the fapl.
+ *
+ * Return:      Non-negative on success/Negative on errors
+ *
+ *-------------------------------------------------------------------------
+ */
+herr_t
+H5Fstop_mdc_logging(hid_t file_id)
+{
+    H5F_t *file;                /* File info */
+    herr_t ret_value = SUCCEED;	/* Return value */
+
+    FUNC_ENTER_API(FAIL)
+    H5TRACE1("e", "i", file_id);
+
+    /* Sanity check */
+    if(NULL == (file = (H5F_t *)H5I_object_verify(file_id, H5I_FILE)))
+	HGOTO_ERROR(H5E_ARGS, H5E_BADTYPE, FAIL, "hid_t identifier is not a file ID")
+
+    /* Call mdc logging function */
+    if(H5C_stop_logging(file->shared->cache) < 0)
+        HGOTO_ERROR(H5E_CACHE, H5E_LOGFAIL, FAIL, "unable to stop mdc logging")
+
+done:
+    FUNC_LEAVE_API(ret_value)
+
+} /* H5Fstop_mdc_logging() */
+
+
+/*-------------------------------------------------------------------------
+ * Function:    H5Fget_mdc_logging_status
+ *
+ * Purpose:     Get the logging flags. is_enabled determines if logging was
+ *              set up via the fapl. is_currently_logging determines if
+ *              log messages are being recorded at this time.
+ *
+ * Return:      Non-negative on success/Negative on errors
+ *
+ *-------------------------------------------------------------------------
+ */
+herr_t
+H5Fget_mdc_logging_status(hid_t file_id, hbool_t *is_enabled,
+                          hbool_t *is_currently_logging)
+{
+    H5F_t *file;                /* File info */
+    herr_t ret_value = SUCCEED;	/* Return value */
+
+    FUNC_ENTER_API(FAIL)
+    H5TRACE3("e", "i*b*b", file_id, is_enabled, is_currently_logging);
+
+    /* Sanity check */
+    if(NULL == (file = (H5F_t *)H5I_object_verify(file_id, H5I_FILE)))
+	HGOTO_ERROR(H5E_ARGS, H5E_BADTYPE, FAIL, "hid_t identifier is not a file ID")
+
+    /* Call mdc logging function */
+    if(H5C_get_logging_status(file->shared->cache, is_enabled, is_currently_logging) < 0)
+        HGOTO_ERROR(H5E_CACHE, H5E_LOGFAIL, FAIL, "unable to get logging status")
+
+done:
+    FUNC_LEAVE_API(ret_value)
+
+} /* H5Fstop_mdc_logging() */
+

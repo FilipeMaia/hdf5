@@ -584,6 +584,7 @@
 ./src/H5Aprivate.h
 ./src/H5Apublic.h
 ./src/H5AC.c
+./src/H5AClog.c
 ./src/H5ACpkg.h
 ./src/H5ACprivate.h
 ./src/H5ACpublic.h
@@ -983,8 +984,10 @@
 ./test/cache_api.c
 ./test/cache_common.c
 ./test/cache_common.h
+./test/cache_logging.c
 ./test/cache_tagging.c
 ./test/cmpd_dset.c
+./test/cork.c
 ./test/corrupt_stab_msg.h5
 ./test/cross_read.c
 ./test/dangle.c
@@ -1150,6 +1153,7 @@
 ./test/use_append_chunk.c
 ./test/use_append_mchunks.c
 ./test/use_common.c
+./test/use_disable_mdc_flushes.c
 ./test/use.h
 ./test/vfd.c
 ./test/test_filters_le.h5
@@ -2347,7 +2351,6 @@
 ./hl/test/image24pixel.txt
 ./hl/test/image24plane.txt
 ./hl/test/image8.txt
-./hl/test/ld_mx.c
 ./hl/test/Makefile.am
 ./hl/test/Makefile.in
 ./hl/test/pal_rgb.h
@@ -2358,12 +2361,9 @@
 ./hl/test/test_dset_opt.c
 ./hl/test/test_ds_le.h5
 ./hl/test/test_file_image.c
-./hl/test/testfiles/test_ld_out1
-./hl/test/testfiles/test_ld_out2
 ./hl/test/test_image.c
 ./hl/test/test_ld.c
 ./hl/test/test_ld.h5
-./hl/test/test_ld.sh.in
 ./hl/test/test_lite.c
 ./hl/test/test_packet.c
 ./hl/test/test_table_be.h5

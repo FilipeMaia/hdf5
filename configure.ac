@@ -26,7 +26,7 @@ AC_PREREQ([2.69])
 ## NOTE: Do not forget to change the version number here when we do a
 ## release!!!
 ##
-AC_INIT([HDF5], [1.9.170-swmr_chksum2], [help@hdfgroup.org])
+AC_INIT([HDF5], [1.9.170-swmr_chksum5], [help@hdfgroup.org])
 AC_CONFIG_SRCDIR([src/H5.c])
 AC_CONFIG_HEADER([src/H5config.h])
 
@@ -4584,7 +4584,6 @@ AC_CONFIG_FILES([src/libhdf5.settings
                  hl/src/Makefile
                  hl/test/Makefile
                  hl/test/H5srcdir_str.h
-		 hl/test/test_ld.sh
                  hl/tools/Makefile
                  hl/tools/gif2h5/Makefile
                  hl/tools/gif2h5/h52giftest.sh

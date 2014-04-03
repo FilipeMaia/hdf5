@@ -98,6 +98,14 @@ TOOLTEST() {
     fi
 }
 
+# run tests for H5Odisable_mdc_flushes/H5Oenable_mdc_flushes/H5Oare_mdc_flushes_disabled here temporary
+USECORK=use_disable_mdc_flushes
+for p in $USECORK; do
+    TOOLTEST $p
+    TOOLTEST $p -y 3
+    TOOLTEST $p -n 3000
+    TOOLTEST $p -n 5000
+done
 
 # run write order test here temporary
 WRITEORDER=twriteorder

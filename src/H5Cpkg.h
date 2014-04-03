@@ -90,10 +90,13 @@
  * flush_in_progress: Boolean flag indicating whether a flush is in
  * 		progress.
  *
- * trace_file_ptr:  File pointer pointing to the trace file, which is used
- *              to record cache operations for use in simulations and design
- *              studies.  This field will usually be NULL, indicating that
- *              no trace file should be recorded.
+ * logging_enabled: Boolean flag indicating whether cache logging
+ *              which is used to record cache operations for use in
+ *              debugging and performance analysis. When this flag is set
+ *              to TRUE, it means that the log file is open and ready to
+ *              receive log entries. It does NOT mean that cache operations
+ *              are currently being recorded. That is controlled by the
+ *              currently_logging flag (below).
  *
  *              Since much of the code supporting the parallel metadata
  *              cache is in H5AC, we don't write the trace file from
@@ -101,6 +104,14 @@
  *
  *              When we get to using H5C in other places, we may add
  *              code to write trace file data at the H5C level as well.
+ *
+ * currently_logging: Boolean flag that indicates if cache operations are
+ *              currently being logged. This flag is flipped by the
+ *              H5Fstart/stop_mdc_logging functions.
+ *             
+ * log_file_ptr:  File pointer pointing to the log file. The I/O functions
+ *              in stdio.h are used to write to the log file regardless of
+ *              the VFD selected.
  *
  * aux_ptr:	Pointer to void used to allow wrapper code to associate
  *		its data with an instance of H5C_t.  The H5C cache code
@@ -292,6 +303,11 @@
  * 		to the slist since the last time this field was set to
  * 		zero.
  *
+ * cork_list_ptr: A skip list to track object addresses that are corked.
+ *		  When an entry is inserted or protected in the cache,
+ *		  the entry's associated object address (tag field) is
+ *		  checked against this skip list.  If found, the entry 
+ *		  is corked.
  *
  * When a cache entry is protected, it must be removed from the LRU
  * list(s) as it cannot be either flushed or evicted until it is unprotected.
@@ -847,7 +863,11 @@ struct H5C_t
 
     hbool_t			flush_in_progress;
 
-    FILE *			trace_file_ptr;
+    hbool_t                     logging_enabled;
+
+    hbool_t                     currently_logging;
+
+    FILE *			log_file_ptr;
 
     void *			aux_ptr;
 
@@ -880,6 +900,8 @@ struct H5C_t
     int64_t			slist_len_increase;
     int64_t			slist_size_increase;
 #endif /* H5C_DO_SANITY_CHECKS */
+
+    H5SL_t *                    cork_list_ptr; /* list of corked object addresses */
 
     int32_t                     pl_len;
     size_t                      pl_size;
